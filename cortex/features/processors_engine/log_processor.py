@@ -69,24 +69,37 @@ class LogProcessor:
 
     def _normalize_eve_log(self, df: pl.DataFrame) -> pl.DataFrame:
         """Normalize Suricata EVE log format."""
-        # Extract severity from alert.severity
+        # Extract severity from alert.severity and normalize columns
         df = df.with_columns(
             [
+                pl.col("timestamp").str.strptime(pl.Datetime, "%Y-%m-%dT%H:%M:%S%.f"),
                 pl.col("alert").struct.field("severity").alias("severity"),
                 pl.col("src_ip").alias("source_ip"),
+                pl.col("dest_ip").alias("destination_ip"),
                 pl.col("proto").alias("protocol"),
+                pl.lit("intrusion_detection").alias("event_type"),
                 pl.lit(0).cast(pl.Int32).alias("connection_count"),
             ]
         )
 
-        return df
+        return df.select(list(self.common_schema.keys()))
 
     def _normalize_clamav_log(self, df: pl.DataFrame) -> pl.DataFrame:
         """Normalize ClamAV log format."""
-        # Add connection_count with default value 0
-        df = df.with_columns([pl.lit(0).cast(pl.Int32).alias("connection_count")])
+        # Convert timestamp from ClamAV format to datetime
+        df = df.with_columns(
+            [
+                pl.col("timestamp").str.to_datetime(format="%a %b %d %H:%M:%S %Y"),
+                pl.col("event_type"),
+                pl.col("severity"),
+                pl.col("source_ip"),
+                pl.col("destination_ip"),
+                pl.col("protocol"),
+                pl.lit(0).cast(pl.Int32).alias("connection_count"),
+            ]
+        )
 
-        return df
+        return df.select(list(self.common_schema.keys()))
 
     def _load_single_file(self, file_path: Path) -> Optional[pl.DataFrame]:
         """Load and normalize a single log file."""
@@ -112,23 +125,7 @@ class LogProcessor:
                 else:  # ClamAV log
                     df = self._normalize_clamav_log(df)
 
-                # Select and cast columns according to common schema
-                normalized_columns = []
-                for col_name, col_type in self.common_schema.items():
-                    if col_name in df.columns:
-                        normalized_columns.append(
-                            pl.col(col_name)
-                            .cast(col_type)
-                            .fill_null(0 if col_type in [pl.Int32, pl.Float64] else "")
-                        )
-                    else:
-                        normalized_columns.append(
-                            pl.lit(0 if col_type in [pl.Int32, pl.Float64] else "")
-                            .cast(col_type)
-                            .alias(col_name)
-                        )
-
-                return df.with_columns(normalized_columns).select(list(self.common_schema.keys()))
+                return df
 
             except pl.exceptions.NoDataError:
                 self.logger.warning(f"No valid data in file: {file_path}")
@@ -140,17 +137,7 @@ class LogProcessor:
 
     def _create_empty_dataframe(self) -> pl.DataFrame:
         """Create an empty DataFrame with the correct schema."""
-        return pl.DataFrame(
-            schema={
-                "timestamp": pl.Datetime,
-                "severity": pl.Int32,
-                "connection_count": pl.Int32,
-                "source_ip": pl.Utf8,
-                "destination_ip": pl.Utf8,
-                "protocol": pl.Utf8,
-                "event_type": pl.Utf8,
-            }
-        )
+        return pl.DataFrame(schema=self.common_schema)
 
     def load_logs(self) -> bool:
         """Load all log files into memory with progress tracking."""
@@ -179,7 +166,7 @@ class LogProcessor:
 
                 for log_file in log_files:
                     df = self._load_single_file(log_file)
-                    if df is not None:
+                    if df is not None and len(df) > 0:
                         dfs.append(df)
                         self.stats["processed_files"] += 1
                     progress.advance(load_task)
