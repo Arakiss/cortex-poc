@@ -55,6 +55,7 @@ coverage.xml
 .hypothesis/
 .pytest_cache/
 cover/
+scripts/
 
 # Translations
 *.mo
@@ -175,6 +176,6 @@ poetry.toml
 # LSP config files
 pyrightconfig.json
 
-reports/
-
 .idea/
+
+reports/
