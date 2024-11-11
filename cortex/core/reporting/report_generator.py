@@ -11,6 +11,7 @@ This module handles the generation and management of security analysis reports, 
     - Consolidated report generation
     - Multi-format report saving (JSON, Markdown)
     - LLM analysis integration
+    - Security rules generation
 """
 
 from datetime import datetime
@@ -29,6 +30,7 @@ from ...features.models.models import (
     LLMInsight,
 )
 from .formatters.markdown import MarkdownFormatter
+from .rule_generator import RuleGenerator
 
 logger = logging.getLogger(__name__)
 
@@ -105,6 +107,7 @@ class ReportGenerator:
         """
         self.reports_dir = reports_dir
         self.reports_dir.mkdir(exist_ok=True)
+        self.rule_generator = RuleGenerator(reports_dir)
 
     def create_batch_report(self, batch_results: Dict[str, Any]) -> SecurityReport:
         """Create a report from batch analysis results."""
@@ -188,6 +191,9 @@ class ReportGenerator:
                 f.write("# LLM Security Analysis\n\n")
                 f.write(extract_llm_content(report.llm_analysis))
             logger.info(f"LLM response saved to {llm_path}")
+
+        # Generate security rules
+        self.rule_generator.generate_rules(report, timestamp)
 
         return json_path, md_path, llm_path
 
@@ -303,5 +309,8 @@ class ReportGenerator:
         with open(md_path, "w") as f:
             f.write(markdown)
         logger.info(f"Final markdown report saved to {md_path}")
+
+        # Generate consolidated security rules
+        self.rule_generator.generate_consolidated_rules(report)
 
         return json_path, md_path
