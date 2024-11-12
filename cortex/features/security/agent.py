@@ -1,22 +1,40 @@
 """Security analysis agent implementation."""
 
 import logging
-import statistics
+import json
+import os
 from datetime import datetime
 from typing import List, Dict, Any, Union, Callable, Optional
 from collections import defaultdict
-import uuid
-import json
-import os
+import random
+import traceback
 
 from pydantic import Field
 from cortex.core.agents.agent import Agent
 from cortex.core.agents import run
 from cortex.core.llm.base_provider import LLMProvider
-from cortex.features.models.security import SecurityEvent, EventSeverity, AnomalyAlert
+from cortex.features.models.security import (
+    SecurityEvent,
+    EventSeverity,
+    AnomalyAlert,
+)
 
-# Configure logging
+from .analyzers.attack_analyzer import AttackAnalyzer
+from .analyzers.risk_assessor import RiskAssessor
+from .analyzers.anomaly_detector import AnomalyDetector
+from .analyzers.pattern_analyzer import PatternAnalyzer
+from .analyzers.statistics_calculator import StatisticsCalculator
+
 logger = logging.getLogger(__name__)
+
+
+class DateTimeEncoder(json.JSONEncoder):
+    """Custom JSON encoder for datetime objects."""
+
+    def default(self, obj):
+        if isinstance(obj, datetime):
+            return obj.isoformat()
+        return super().default(obj)
 
 
 class SecurityAnalysisAgent(Agent):
@@ -24,7 +42,7 @@ class SecurityAnalysisAgent(Agent):
 
     name: str = "security_analysis_agent"
     role: str = "Security log analyzer for pattern detection and threat analysis"
-    model: str = os.getenv("MODEL_NAME", "gpt-4o-mini")  # Use model from environment
+    model: str = os.getenv("MODEL_NAME", "gpt-4o-mini")
     instructions: Union[str, Callable[..., str]] = (
         "You are a security analysis agent specialized in analyzing security logs and identifying attack patterns. "
         "Your analysis should focus on:\n"
@@ -38,141 +56,252 @@ class SecurityAnalysisAgent(Agent):
     tool_choice: Optional[str] = None
     parallel_tool_calls: bool = True
 
-    # Add model fields with proper initialization
+    # Processing metrics
     events_processed: int = 0
     patterns_detected: List[Dict[str, Any]] = Field(default_factory=list)
     anomalies_detected: List[AnomalyAlert] = Field(default_factory=list)
-    historical_metrics: Dict[str, List[float]] = Field(default_factory=lambda: defaultdict(list))
 
-    class Config:
-        arbitrary_types_allowed = True
+    # Analyzers
+    attack_analyzer: AttackAnalyzer = Field(default_factory=AttackAnalyzer)
+    risk_assessor: RiskAssessor = Field(default_factory=RiskAssessor)
+    anomaly_detector: AnomalyDetector = Field(default_factory=AnomalyDetector)
+    pattern_analyzer: Optional[PatternAnalyzer] = None
+    statistics_calculator: StatisticsCalculator = Field(default_factory=StatisticsCalculator)
 
     def __init__(self, **data):
+        """Initialize security analysis agent with its analyzers."""
         super().__init__(**data)
-        self.historical_metrics = defaultdict(list)
+        # Initialize PatternAnalyzer after other analyzers are created
+        self.pattern_analyzer = PatternAnalyzer(self.attack_analyzer, self.risk_assessor)
 
-    def _assess_overall_risk(
-        self,
-        patterns: List[Dict[str, Any]],
-        anomalies: List[AnomalyAlert],
-        statistics: Dict[str, Any],
-    ) -> Dict[str, Any]:
-        """Evaluates the overall risk level based on all analyzed data."""
-        risk_factors = {
-            "pattern_risk": 0.0,
-            "anomaly_risk": 0.0,
-            "geographic_risk": 0.0,
-            "protocol_risk": 0.0,
-        }
+    def _get_event_severity(self, event: Dict[str, Any]) -> EventSeverity:
+        """Extract severity from event, with fallbacks for different event types."""
+        try:
+            logger.debug(f"Processing event for severity: {json.dumps(event, default=str)[:200]}")
 
-        # Evaluate pattern risk
-        if patterns:
-            high_confidence_patterns = len([p for p in patterns if p["confidence_score"] > 0.7])
-            risk_factors["pattern_risk"] = min(high_confidence_patterns / 10, 1.0)
+            # Direct severity field (ClamAV format)
+            if "severity" in event:
+                severity_value = event["severity"]
+                if isinstance(severity_value, (int, float)):
+                    logger.debug(f"Found direct severity: {severity_value}")
+                    return self._convert_to_event_severity(severity_value)
 
-        # Evaluate anomaly risk
-        if anomalies:
-            critical_anomalies = len([a for a in anomalies if a.requires_immediate_action])
-            risk_factors["anomaly_risk"] = min(critical_anomalies / 5, 1.0)
+            # Alert severity (EVE format)
+            if "alert" in event:
+                alert = event.get("alert", {})
+                if isinstance(alert, dict) and "severity" in alert:
+                    severity_value = alert["severity"]
+                    if isinstance(severity_value, (int, float)):
+                        logger.debug(f"Found alert severity: {severity_value}")
+                        return self._convert_to_event_severity(severity_value)
 
-        # Evaluate geographic risk
-        country_dist = statistics.get("geographic_distribution", {}).get("countries", {})
-        if country_dist:
-            high_risk_countries = len(
-                [
-                    c
-                    for c, count in country_dist.items()
-                    if count > statistics.get("total_events", 0) * 0.1
-                ]
+            # Fallback severity based on event type
+            event_type = event.get("event_type")
+            if event_type in ["malware_detection", "attack", "intrusion"]:
+                logger.debug(f"Using fallback severity for event type: {event_type}")
+                return EventSeverity.HIGH
+
+            logger.debug("Using default LOW severity")
+            return EventSeverity.LOW
+
+        except Exception as e:
+            logger.error(
+                f"Error getting severity: {str(e)}\nEvent: {json.dumps(event, default=str)[:200]}\nTraceback: {traceback.format_exc()}"
             )
-            risk_factors["geographic_risk"] = min(high_risk_countries / 5, 1.0)
+            return EventSeverity.LOW
 
-        # Evaluate protocol risk
-        protocol_dist = statistics.get("protocols", {})
-        if protocol_dist:
-            vulnerable_protocols = len(
-                [p for p in protocol_dist.keys() if p.lower() in ["telnet", "ftp", "http"]]
+    def _convert_to_event_severity(self, severity: Union[int, float]) -> EventSeverity:
+        """Convert numeric severity to EventSeverity enum."""
+        try:
+            if severity > 4:
+                return EventSeverity.EMERGENCY
+            elif severity > 3:
+                return EventSeverity.CRITICAL
+            elif severity > 2:
+                return EventSeverity.HIGH
+            elif severity > 1:
+                return EventSeverity.MEDIUM
+            return EventSeverity.LOW
+        except Exception as e:
+            logger.error(f"Error converting severity {severity}: {str(e)}")
+            return EventSeverity.LOW
+
+    def _normalize_event(self, event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Normalizes different event formats into a standard structure."""
+        try:
+            logger.debug(f"Normalizing event: {json.dumps(event, default=str)[:200]}")
+
+            # Base structure for normalized event
+            normalized = {
+                "timestamp": event.get("timestamp"),
+                "source_ip": event.get("source_ip") or event.get("src_ip"),
+                "destination_ip": event.get("destination_ip") or event.get("dest_ip"),
+                "event_type": event.get("event_type"),
+                "protocol": event.get("protocol") or event.get("proto"),
+                "raw_data": {},
+                "connection_count": 1,  # Default value
+            }
+
+            # Get severity first to avoid potential KeyError
+            try:
+                normalized["severity"] = self._get_event_severity(event)
+            except Exception as e:
+                logger.error(f"Error getting severity during normalization: {str(e)}")
+                normalized["severity"] = EventSeverity.LOW
+
+            # Handle ClamAV specific fields
+            if "scan_details" in event:
+                logger.debug("Processing ClamAV format")
+                normalized["raw_data"]["scan_details"] = event["scan_details"]
+                normalized["attack_type"] = "malware"
+                normalized["attack_details"] = {
+                    "malware_type": event["scan_details"].get("malware_type"),
+                    "action_taken": event["scan_details"].get("action_taken"),
+                    "file_type": event["scan_details"].get("file_type"),
+                }
+
+            # Handle EVE specific fields
+            if "alert" in event:
+                logger.debug("Processing EVE format")
+                alert = event.get("alert", {})
+                if isinstance(alert, dict):
+                    normalized["raw_data"]["alert"] = alert
+                    normalized["attack_type"] = "network"
+                    normalized["attack_details"] = {
+                        "signature": alert.get("signature"),
+                        "category": alert.get("category"),
+                        "signature_id": alert.get("signature_id"),
+                    }
+
+            # Add geographic data if available
+            if "src_country" in event:
+                normalized["source_country"] = event["src_country"]
+                normalized["source_continent"] = event.get("src_continent")
+
+            # Add protocol specific information
+            for field in ["http", "port_scan", "anomaly", "geo_context", "auth", "protocol_info"]:
+                if field in event:
+                    normalized["raw_data"][field] = event[field]
+
+            # Ensure all required fields are present
+            required_fields = ["timestamp", "source_ip", "event_type", "severity"]
+            missing_fields = [field for field in required_fields if not normalized.get(field)]
+
+            if missing_fields:
+                logger.warning(f"Missing required fields in event: {missing_fields}")
+                return None
+
+            logger.debug(
+                f"Successfully normalized event: {json.dumps(normalized, default=str)[:200]}"
             )
-            risk_factors["protocol_risk"] = min(vulnerable_protocols / 3, 1.0)
+            return normalized
 
-        # Calculate overall risk score
-        overall_risk_score = sum(risk_factors.values()) / len(risk_factors)
-        risk_level = (
-            "CRITICAL"
-            if overall_risk_score > 0.8
-            else "HIGH"
-            if overall_risk_score > 0.6
-            else "MEDIUM"
-            if overall_risk_score > 0.3
-            else "LOW"
-        )
-
-        return {
-            "risk_score": overall_risk_score,
-            "risk_level": risk_level,
-            "risk_factors": risk_factors,
-            "assessment_timestamp": datetime.now().isoformat(),
-        }
+        except Exception as e:
+            logger.error(
+                f"Error normalizing event: {str(e)}\nEvent: {json.dumps(event, default=str)[:200]}\nTraceback: {traceback.format_exc()}"
+            )
+            return None
 
     async def analyze_batch(
         self, events: List[Dict[str, Any]], llm_provider: LLMProvider
     ) -> Dict[str, Any]:
-        """Analyzes a batch of security events."""
+        """Analyzes a batch of security events with enhanced context."""
         try:
-            normalized_events = []
-            batch_metrics = defaultdict(list)
+            logger.debug(f"Starting batch analysis of {len(events)} events")
 
-            # Normalize events and collect metrics
+            # Initialize metrics collection
+            batch_metrics = defaultdict(list)
+            normalized_events = []
+
+            # Process events one at a time
             for event in events:
                 try:
-                    if "severity" in event:
-                        severity = event["severity"]
-                        if isinstance(severity, int):
-                            if severity > 3:
-                                event["severity"] = EventSeverity.HIGH
-                            elif severity < 1:
-                                event["severity"] = EventSeverity.LOW
-                            else:
-                                event["severity"] = EventSeverity(severity)
+                    logger.debug(f"Processing event: {json.dumps(event, default=str)[:200]}")
 
-                    security_event = SecurityEvent(**event)
-                    normalized_events.append(security_event.model_dump())
+                    # Normalize the event
+                    normalized_event = self._normalize_event(event)
 
-                    # Collect metrics for anomaly detection
-                    batch_metrics["connection_count"].append(security_event.connection_count)
-                    batch_metrics["severity"].append(security_event.severity)
+                    # Skip events that couldn't be normalized
+                    if not normalized_event:
+                        logger.warning("Event normalization failed, skipping")
+                        continue
+
+                    # Add attack categorization
+                    try:
+                        attack_category = self.attack_analyzer.categorize_attack(normalized_event)
+                        if attack_category:
+                            normalized_event["attack_category"] = attack_category
+                            normalized_event["attack_details"] = (
+                                self.attack_analyzer.extract_attack_details(normalized_event)
+                            )
+                    except Exception as e:
+                        logger.error(f"Error in attack categorization: {str(e)}")
+                        continue
+
+                    # Convert to Pydantic model and back to dict
+                    try:
+                        logger.debug("Converting to SecurityEvent model")
+                        security_event = SecurityEvent(**normalized_event)
+                        normalized_event = security_event.model_dump()
+                        normalized_events.append(normalized_event)
+
+                        # Collect metrics for anomaly detection
+                        batch_metrics["connection_count"].append(security_event.connection_count)
+                        batch_metrics["severity"].append(security_event.severity)
+                        if attack_category:
+                            batch_metrics[attack_category].append(1)
+                    except Exception as e:
+                        logger.error(
+                            f"Error converting to SecurityEvent: {str(e)}\nEvent: {json.dumps(normalized_event, default=str)[:200]}\nTraceback: {traceback.format_exc()}"
+                        )
+                        continue
 
                 except Exception as e:
-                    logger.error(f"Error processing event: {str(e)}")
+                    logger.error(
+                        f"Error processing event: {str(e)}\nEvent: {json.dumps(event, default=str)[:200]}\nTraceback: {traceback.format_exc()}"
+                    )
                     continue
 
+            # Skip further processing if no events were normalized
+            if not normalized_events:
+                logger.error("No events could be normalized in the batch")
+                raise ValueError("No events could be normalized")
+
+            logger.info(f"Successfully normalized {len(normalized_events)} events")
             self.events_processed += len(normalized_events)
 
-            # Update historical metrics
-            for metric, values in batch_metrics.items():
-                self.historical_metrics[metric].extend(values)
+            # Update anomaly detector metrics
+            self.anomaly_detector.update_metrics(batch_metrics)
 
-            # Detect patterns
-            patterns = self._extract_patterns(normalized_events)
-
-            # Detect anomalies
-            anomalies = self._detect_anomalies(batch_metrics, normalized_events)
+            # Detect patterns and anomalies
+            patterns = self.pattern_analyzer.extract_patterns(normalized_events)
+            anomalies = self.anomaly_detector.detect_anomalies(
+                batch_metrics, normalized_events, self.attack_analyzer.categorize_attack
+            )
 
             # Calculate batch statistics
-            batch_stats = self._calculate_batch_statistics(normalized_events)
+            batch_stats = self.statistics_calculator.calculate_batch_statistics(normalized_events)
 
             # Calculate risk assessment
-            risk_assessment = self._assess_overall_risk(patterns, anomalies, batch_stats)
+            risk_assessment = self.risk_assessor.assess_overall_risk(
+                patterns, anomalies, batch_stats
+            )
 
-            # Process events using LLM for human-readable analysis
+            # Process a sample of events for LLM analysis
+            if normalized_events:
+                sample_size = min(5, len(normalized_events))
+                sample_events = random.sample(normalized_events, sample_size)
+            else:
+                sample_events = []
+
             prompt = (
-                "Analyze the following security events and provide:\n"
+                "Analyze the following sample of security events and provide:\n"
                 "1. Key findings and attack patterns\n"
                 "2. Risk assessment and potential impact\n"
                 "3. Specific recommendations for mitigation\n"
                 "4. Geographic and temporal patterns\n"
                 "5. Protocol-specific concerns\n\n"
-                f"Events: {json.dumps(normalized_events, indent=2)}"
+                f"Sample Events: {json.dumps(sample_events, indent=2, cls=DateTimeEncoder)}"
             )
 
             messages = [{"role": "user", "content": prompt}]
@@ -189,51 +318,43 @@ class SecurityAnalysisAgent(Agent):
                 logger.error(f"Error in LLM processing: {str(e)}")
                 llm_content = None
 
-            # Calculate batch statistics
-            batch_stats = self._calculate_batch_statistics(normalized_events)
+            transformed_anomalies = [
+                {
+                    "alert_id": anomaly.alert_id,
+                    "alert_type": anomaly.alert_type,
+                    "severity": anomaly.severity,
+                    "recommendation": anomaly.recommendation,
+                    "requires_immediate_action": anomaly.requires_immediate_action,
+                    "baseline_value": anomaly.baseline_value,
+                    "current_value": anomaly.current_value,
+                    "attack_category": anomaly.attack_category,
+                    "affected_systems": anomaly.affected_systems,
+                    "potential_impact": anomaly.potential_impact,
+                    "mitigation_steps": anomaly.mitigation_steps,
+                }
+                for anomaly in anomalies
+            ]
 
-            # Generate recommendations based on patterns and anomalies
-            recommendations = self._generate_recommendations(patterns, anomalies, batch_stats)
-
-            # Transformar las anomalías al formato esperado por Anomaly
-            transformed_anomalies = []
-            for anomaly in anomalies:
-                transformed_anomalies.append(
-                    {
-                        "alert_id": anomaly.alert_id,
-                        "alert_type": anomaly.alert_type,
-                        "severity": anomaly.severity,
-                        "recommendation": anomaly.recommendation,
-                        "requires_immediate_action": anomaly.requires_immediate_action,
-                        "baseline_value": anomaly.baseline_value,
-                        "current_value": anomaly.current_value,
-                    }
-                )
-
+            logger.info("Batch analysis completed successfully")
             return {
-                "timestamp": datetime.now(),
+                "timestamp": datetime.now().isoformat(),
                 "events_analyzed": len(normalized_events),
                 "patterns": patterns,
                 "anomalies": transformed_anomalies,
                 "risk_assessment": risk_assessment,
                 "llm_analysis": {
                     "raw_response": llm_content,
-                    "recommendations": recommendations,
                 },
                 "batch_statistics": batch_stats,
-                "metrics": {
-                    metric: {
-                        "mean": statistics.mean(values) if values else 0,
-                        "std": statistics.stdev(values) if len(values) > 1 else 0,
-                    }
-                    for metric, values in batch_metrics.items()
-                },
             }
+
         except Exception as e:
-            logger.error(f"Error in analyze_batch: {str(e)}")
+            logger.error(f"Error in analyze_batch: {str(e)}\nTraceback: {traceback.format_exc()}")
             return {
-                "timestamp": datetime.now(),
-                "events_analyzed": 0,
+                "status": "error",
+                "error": str(e),
+                "traceback": traceback.format_exc(),
+                "events_processed": 0,
                 "patterns": [],
                 "anomalies": [],
                 "risk_assessment": {
@@ -244,233 +365,4 @@ class SecurityAnalysisAgent(Agent):
                 },
                 "llm_analysis": None,
                 "batch_statistics": {},
-                "metrics": {},
             }
-
-    def _detect_anomalies(
-        self, batch_metrics: Dict[str, List[float]], events: List[Dict[str, Any]]
-    ) -> List[AnomalyAlert]:
-        """Detects anomalies in the current batch by comparing with historical metrics."""
-        anomalies = []
-
-        # Analyze connection counts
-        connection_counts = self.historical_metrics.get("connection_count", [])
-        if connection_counts:
-            hist_mean = statistics.mean(connection_counts)
-            hist_std = statistics.stdev(connection_counts) if len(connection_counts) > 1 else 0
-
-            current_mean = statistics.mean(batch_metrics.get("connection_count", []) or [0])
-            if abs(current_mean - hist_mean) > (2 * hist_std):
-                anomalies.append(
-                    AnomalyAlert(
-                        alert_id=f"ANOM-{uuid.uuid4().hex[:8]}",
-                        timestamp=datetime.now(),
-                        ip_address="multiple",
-                        alert_type="connection_frequency",
-                        severity=4 if current_mean > hist_mean else 3,
-                        baseline_value=hist_mean,
-                        current_value=current_mean,
-                        recommendation="Investigate unusual connection frequency pattern",
-                        requires_immediate_action=current_mean > (hist_mean + 3 * hist_std),
-                    )
-                )
-
-        # Analyze severity distribution
-        severity_counts = defaultdict(int)
-        for event in events:
-            severity_counts[event["severity"]] += 1
-
-        if severity_counts[EventSeverity.HIGH] > len(events) * 0.3:  # More than 30% high severity
-            anomalies.append(
-                AnomalyAlert(
-                    alert_id=f"ANOM-{uuid.uuid4().hex[:8]}",
-                    timestamp=datetime.now(),
-                    ip_address="multiple",
-                    alert_type="severity_spike",
-                    severity=5,
-                    baseline_value=len(events) * 0.1,  # Expected 10% high severity
-                    current_value=severity_counts[EventSeverity.HIGH],
-                    recommendation="Investigate high concentration of severe events",
-                    requires_immediate_action=True,
-                )
-            )
-
-        return anomalies
-
-    def _calculate_batch_statistics(self, events: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """Calculates detailed statistics for the batch."""
-        stats = {
-            "event_count": len(events),
-            "unique_sources": len(set(e["source_ip"] for e in events)),
-            "unique_destinations": len(set(e["destination_ip"] for e in events)),
-            "protocols": defaultdict(int),
-            "event_types": defaultdict(int),
-            "severity_distribution": defaultdict(int),
-            "geographic_distribution": defaultdict(lambda: defaultdict(int)),
-            "temporal_distribution": defaultdict(int),
-        }
-
-        for event in events:
-            stats["protocols"][event["protocol"]] += 1
-            stats["event_types"][event["event_type"]] += 1
-            stats["severity_distribution"][str(event["severity"])] += 1
-
-            if event.get("country_code"):
-                stats["geographic_distribution"]["countries"][event["country_code"]] += 1
-            if event.get("continent_code"):
-                stats["geographic_distribution"]["continents"][event["continent_code"]] += 1
-
-            hour = datetime.fromisoformat(event["timestamp"]).hour
-            stats["temporal_distribution"][hour] += 1
-
-        # Convert defaultdicts to regular dicts for serialization
-        return {k: dict(v) if isinstance(v, defaultdict) else v for k, v in stats.items()}
-
-    def _extract_patterns(self, events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Extracts attack patterns from analyzed events."""
-        patterns = []
-        event_groups = defaultdict(list)
-
-        # Group events by source IP and event type
-        for event in events:
-            key = (event["source_ip"], event["event_type"])
-            event_groups[key].append(event)
-
-        # Analyze each group for patterns
-        for (source_ip, event_type), group in event_groups.items():
-            if len(group) >= 3:  # Minimum events to consider a pattern
-                first_event = min(group, key=lambda x: datetime.fromisoformat(x["timestamp"]))
-                last_event = max(group, key=lambda x: datetime.fromisoformat(x["timestamp"]))
-
-                # Calculate confidence score based on various factors
-                frequency = len(group)
-                time_span = (
-                    datetime.fromisoformat(last_event["timestamp"])
-                    - datetime.fromisoformat(first_event["timestamp"])
-                ).total_seconds() / 3600  # Convert to hours
-
-                if time_span > 0:
-                    events_per_hour = frequency / time_span
-                    confidence_score = min(events_per_hour / 10, 1.0)  # Normalize to 0-1
-                else:
-                    confidence_score = 1.0 if frequency > 5 else 0.7
-
-                # Collect affected ports and protocols
-                affected_ports = list(
-                    set(
-                        int(e.get("destination_port", 0))
-                        for e in group
-                        if e.get("destination_port")
-                    )
-                )
-                protocol_dist = defaultdict(int)
-                for e in group:
-                    protocol_dist[e["protocol"]] += 1
-
-                # Create pattern object
-                pattern = {
-                    "pattern_id": f"PTN-{uuid.uuid4().hex[:8]}",
-                    "source_ips": [source_ip],
-                    "geographic_data": {
-                        "country": group[0].get("country_code"),
-                        "continent": group[0].get("continent_code"),
-                    },
-                    "frequency": frequency,
-                    "attack_type": event_type,
-                    "confidence_score": confidence_score,
-                    "first_seen": first_event["timestamp"],
-                    "last_seen": last_event["timestamp"],
-                    "affected_ports": affected_ports,
-                    "protocol_distribution": dict(protocol_dist),
-                }
-                patterns.append(pattern)
-
-        return patterns
-
-    def _generate_recommendations(
-        self,
-        patterns: List[Dict[str, Any]],
-        anomalies: List[AnomalyAlert],
-        statistics: Dict[str, Any],
-    ) -> List[Dict[str, Any]]:
-        """Generates actionable recommendations based on patterns and anomalies."""
-        recommendations = []
-
-        # Pattern-based recommendations
-        for pattern in patterns:
-            if pattern["confidence_score"] > 0.7:
-                recommendations.append(
-                    {
-                        "type": "pattern",
-                        "priority": "high" if pattern["confidence_score"] > 0.9 else "medium",
-                        "finding": f"Detected {pattern['attack_type']} pattern from {pattern['source_ips'][0]}",
-                        "action": f"Implement blocking rules for {pattern['attack_type']} from identified source",
-                        "details": {
-                            "pattern_id": pattern["pattern_id"],
-                            "affected_ports": pattern["affected_ports"],
-                            "protocols": list(pattern["protocol_distribution"].keys()),
-                        },
-                    }
-                )
-
-        # Anomaly-based recommendations
-        for anomaly in anomalies:
-            recommendations.append(
-                {
-                    "type": "anomaly",
-                    "priority": "critical" if anomaly.requires_immediate_action else "high",
-                    "finding": f"Detected {anomaly.alert_type} anomaly",
-                    "action": anomaly.recommendation,
-                    "details": {
-                        "alert_id": anomaly.alert_id,
-                        "severity": anomaly.severity,
-                        "baseline": anomaly.baseline_value,
-                        "current": anomaly.current_value,
-                    },
-                }
-            )
-
-        # Protocol-based recommendations
-        protocol_dist = statistics.get("protocols", {})
-        vulnerable_protocols = [
-            p for p in protocol_dist.keys() if p.lower() in ["telnet", "ftp", "http"]
-        ]
-        if vulnerable_protocols:
-            recommendations.append(
-                {
-                    "type": "protocol",
-                    "priority": "medium",
-                    "finding": f"High usage of vulnerable protocols: {', '.join(vulnerable_protocols)}",
-                    "action": "Consider upgrading to secure alternatives (SSH, SFTP, HTTPS)",
-                    "details": {
-                        "protocols": vulnerable_protocols,
-                        "usage_counts": {p: protocol_dist[p] for p in vulnerable_protocols},
-                    },
-                }
-            )
-
-        return recommendations
-
-    def _extract_ports(self, events: List[Dict[str, Any]]) -> List[int]:
-        """Extracts affected ports from events."""
-        ports = set()
-        for event in events:
-            if ":" in event["destination_ip"]:
-                try:
-                    port = int(event["destination_ip"].split(":")[-1])
-                    ports.add(port)
-                except ValueError:
-                    continue
-        return list(ports)
-
-    def _get_protocol_distribution(self, events: List[Dict[str, Any]]) -> Dict[str, int]:
-        """Calculates protocol distribution in events."""
-        distribution = defaultdict(int)
-        for event in events:
-            distribution[event["protocol"]] += 1
-        return dict(distribution)
-
-    def _estimate_batch_cost(self, batch: List[Dict[str, Any]]) -> float:
-        """Estimates the cost of processing a batch."""
-        estimated_tokens = sum(len(str(event)) for event in batch) / 4
-        return (estimated_tokens / 1000) * 0.01

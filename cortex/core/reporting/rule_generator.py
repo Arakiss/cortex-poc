@@ -6,14 +6,13 @@ This module generates actionable security rules based on analysis results:
 - iptables rules for network blocking
 """
 
-from typing import List, Dict, Any, Set
+from typing import Dict, Any, Set
 from pathlib import Path
 import json
 import logging
 from datetime import datetime
-import re
 
-from ...features.models.models import SecurityReport, ConsolidatedReport, Pattern, Anomaly
+from ...features.models.models import SecurityReport, ConsolidatedReport
 
 logger = logging.getLogger(__name__)
 
@@ -31,25 +30,22 @@ class RuleGenerator:
         self.rules_dir = reports_dir / "rules"
         self.rules_dir.mkdir(exist_ok=True)
 
-    def _extract_malware_info(self, anomaly: Anomaly) -> Dict[str, str]:
+    def _extract_malware_info(self, anomaly: Dict[str, Any]) -> Dict[str, str]:
         """Extract malware information from anomaly details."""
         malware_info = {}
-        if "raw_log" in anomaly.__dict__:
+        if "raw_log" in anomaly:
             # Extract malware type from ClamAV log
-            match = re.search(r"Found ([\w\.]+) in connection from", anomaly.raw_log)
-            if match:
-                malware_info["type"] = match.group(1)
+            if "signature" in anomaly:
+                malware_info["type"] = anomaly["signature"]
             # Extract source IP
-            match = re.search(r"connection from ([\d\.]+)", anomaly.raw_log)
-            if match:
-                malware_info["source_ip"] = match.group(1)
+            if "source_ip" in anomaly:
+                malware_info["source_ip"] = anomaly["source_ip"]
             # Extract file type if present
-            match = re.search(r"file_type\": \"(\w+)\"", anomaly.raw_log)
-            if match:
-                malware_info["file_type"] = match.group(1)
+            if "file_type" in anomaly:
+                malware_info["file_type"] = anomaly["file_type"]
         return malware_info
 
-    def _generate_suricata_rule(self, anomaly: Anomaly, rule_id: int) -> str:
+    def _generate_suricata_rule(self, anomaly: Dict[str, Any], rule_id: int) -> str:
         """Generate a Suricata rule from detected malware."""
         malware_info = self._extract_malware_info(anomaly)
         if not malware_info:
@@ -57,17 +53,18 @@ class RuleGenerator:
 
         # Create specific rule based on malware type and source
         rule = (
-            f"alert tcp {malware_info.get('source_ip', 'any')} any -> $HOME_NET any "
+            f"alert {anomaly.get('protocol', 'tcp')} "
+            f"{malware_info.get('source_ip', 'any')} "
+            f"{anomaly.get('port', 'any')} -> $HOME_NET any "
             f'(msg:"ET MALWARE {malware_info.get("type", "Unknown")} Activity"; '
             f'flow:established,to_server; '
             f'classtype:trojan-activity; '
-            f'reference:url,docs.suricata.io/en/latest/rules/intro.html; '
             f'threshold:type limit,track by_src,seconds 60,count 1; '
             f'sid:{rule_id}; rev:1;)'
         )
         return rule
 
-    def _generate_clamav_signature(self, anomaly: Anomaly) -> str:
+    def _generate_clamav_signature(self, anomaly: Dict[str, Any]) -> str:
         """Generate a ClamAV signature from detected malware."""
         malware_info = self._extract_malware_info(anomaly)
         if not malware_info:
@@ -92,7 +89,7 @@ class RuleGenerator:
         else:
             return f"{sig_name}:0:*:Malicious.Content"
 
-    def _generate_iptables_rule(self, anomaly: Anomaly) -> str:
+    def _generate_iptables_rule(self, anomaly: Dict[str, Any]) -> str:
         """Generate an iptables rule from detected malware source."""
         malware_info = self._extract_malware_info(anomaly)
         if not malware_info or "source_ip" not in malware_info:
@@ -100,7 +97,7 @@ class RuleGenerator:
 
         # Create specific rule based on severity and malware type
         source_ip = malware_info["source_ip"]
-        if anomaly.severity >= 4:  # High severity - block all traffic
+        if anomaly["severity"] >= 4:  # High severity - block all traffic
             return f"iptables -A INPUT -s {source_ip} -j DROP"
         else:  # Lower severity - log and limit rate
             return (
@@ -119,14 +116,17 @@ class RuleGenerator:
         rule_id = 1000000  # Starting SID for custom rules
 
         for anomaly in report.anomalies:
-            malware_info = self._extract_malware_info(anomaly)
+            # Convert Anomaly model to dict for processing
+            anomaly_dict = anomaly.model_dump()
+
+            malware_info = self._extract_malware_info(anomaly_dict)
             if malware_info:
                 if "source_ip" in malware_info:
                     source_ips.add(malware_info["source_ip"])
                 if "type" in malware_info:
                     malware_types.add(malware_info["type"])
 
-                rule = self._generate_suricata_rule(anomaly, rule_id)
+                rule = self._generate_suricata_rule(anomaly_dict, rule_id)
                 if rule:
                     suricata_rules.append(rule)
                     rule_id += 1
@@ -143,7 +143,7 @@ class RuleGenerator:
         # Generate ClamAV signatures
         clamav_sigs = []
         for anomaly in report.anomalies:
-            sig = self._generate_clamav_signature(anomaly)
+            sig = self._generate_clamav_signature(anomaly.model_dump())
             if sig:
                 clamav_sigs.append(sig)
 
@@ -159,7 +159,7 @@ class RuleGenerator:
         # Generate iptables rules
         iptables_rules = []
         for anomaly in report.anomalies:
-            rule = self._generate_iptables_rule(anomaly)
+            rule = self._generate_iptables_rule(anomaly.model_dump())
             if rule:
                 iptables_rules.append(rule)
 
@@ -185,7 +185,7 @@ class RuleGenerator:
             iptables_path.chmod(0o755)  # Make executable
             logger.info(f"iptables rules saved to {iptables_path}")
 
-        # Create a detailed summary of detected threats
+        # Create detailed summary of detected threats
         summary = {
             "analysis_period": {
                 "start": report.summary["analysis_timestamp"],
@@ -208,11 +208,56 @@ class RuleGenerator:
                 "risk_factors": report.risk_assessment.risk_factors,
             },
             "recommendations": [
-                "Deploy generated Suricata rules to detect similar attacks",
-                "Update ClamAV with new signatures to catch observed malware",
-                "Apply iptables rules to block malicious source IPs",
-                "Monitor effectiveness of rules and adjust as needed",
-                "Consider implementing additional security measures for critical assets",
+                {
+                    "title": "Network Detection",
+                    "priority": "HIGH",
+                    "action": "Deploy generated Suricata rules",
+                    "details": {
+                        "rules_count": len(suricata_rules),
+                        "coverage": list(malware_types),
+                    },
+                    "steps": [
+                        "Install rules in Suricata configuration",
+                        "Enable real-time alerting",
+                        "Monitor rule effectiveness",
+                    ],
+                },
+                {
+                    "title": "Malware Prevention",
+                    "priority": "HIGH",
+                    "action": "Update ClamAV signatures",
+                    "details": {
+                        "signatures_count": len(clamav_sigs),
+                        "malware_types": list(malware_types),
+                    },
+                    "steps": [
+                        "Add signatures to ClamAV database",
+                        "Run full system scan",
+                        "Enable real-time protection",
+                    ],
+                },
+                {
+                    "title": "Network Blocking",
+                    "priority": "HIGH",
+                    "action": "Apply iptables rules",
+                    "details": {"blocked_ips": len(source_ips), "rule_count": len(iptables_rules)},
+                    "steps": [
+                        "Review and test rules",
+                        "Apply rules to production",
+                        "Monitor for false positives",
+                    ],
+                },
+                {
+                    "title": "Ongoing Monitoring",
+                    "priority": "MEDIUM",
+                    "action": "Enhance security monitoring",
+                    "details": {"focus_areas": ["Network traffic", "System logs", "File activity"]},
+                    "steps": [
+                        "Configure log aggregation",
+                        "Set up alerts for anomalies",
+                        "Review security dashboards",
+                    ],
+                },
             ],
         }
 
